@@ -98,16 +98,35 @@ lark-cli base +dashboard-block-get \
 
 ## 返回结构总览
 
-服务端响应外层仍然是标准 OpenAPI 包装：
+CLI 输出标准成功信封（判断成功用 `ok == true` 或退出码 0，不要找 `code == 0`）：
 
 ```json
 {
-  "code": 0,
-  "msg": "success",
+  "ok": true,
+  "identity": "user",
   "data": {
-    "dimensions": [...],
-    "measures": [...],
-    "main_data": [...]
+    "dimensions": [
+      {
+        "field_name": "地区",
+        "alias": "dim_region"
+      }
+    ],
+    "measures": [
+      {
+        "field_name": "销售额",
+        "alias": "me_sales"
+      }
+    ],
+    "main_data": [
+      {
+        "dim_region": {
+          "value": "华东"
+        },
+        "me_sales": {
+          "value": 12345
+        }
+      }
+    ]
   }
 }
 ```
