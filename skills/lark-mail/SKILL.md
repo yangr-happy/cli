@@ -272,6 +272,7 @@ lark-cli mail user_mailbox.folders create \
 
 - `user_mailbox_id` 几乎所有邮箱 API 都需要，一般传 `"me"` 代表当前用户
 - 列表接口支持 `--page-all` 自动翻页，无需手动处理 `page_token`
+- 用户邮箱级黑白名单写入后，关键字搜索缓存可能需要数秒才能就绪；期间新写入的发件人可能延迟出现在搜索结果中。CLI 遇到该缓存未命中会自动检查名单，并在名单非空时等待 2 秒重试一次。
 
 ## Shortcuts（推荐优先使用）
 

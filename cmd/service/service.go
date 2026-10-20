@@ -5,10 +5,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/apicatalog"
@@ -455,7 +457,13 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 			client.PaginationOptions{PageLimit: opts.PageLimit, PageDelay: opts.PageDelay}, checkErr)
 	}
 
-	resp, err := ac.DoAPI(opts.Ctx, request)
+	resp, err := runUserAllowBlockSearchWithCacheRecovery(
+		opts.Ctx,
+		opts.Method.ID,
+		request,
+		ac.DoAPI,
+		time.Sleep,
+	)
 	if err != nil {
 		return err
 	}
@@ -470,6 +478,168 @@ func serviceMethodRun(opts *ServiceMethodOptions) error {
 		Identity:    opts.As,
 		CheckError:  checkErr,
 	})
+}
+
+const userAllowBlockSearchRetryDelay = 2 * time.Second
+
+type serviceRequestFunc func(context.Context, client.RawApiRequest) (*larkcore.ApiResp, error)
+
+type serviceSleepFunc func(time.Duration)
+
+// runUserAllowBlockSearchWithCacheRecovery smooths over the mail service's
+// eventually-consistent keyword-search cache. The request and sleep functions
+// are injected so the complete retry contract can be tested without a real API
+// call or a two-second test delay.
+func runUserAllowBlockSearchWithCacheRecovery(
+	ctx context.Context,
+	methodID string,
+	request client.RawApiRequest,
+	doRequest serviceRequestFunc,
+	sleep serviceSleepFunc,
+) (*larkcore.ApiResp, error) {
+	response, err := doRequest(ctx, request)
+	if err != nil || !isUserAllowBlockSenderListMethod(methodID) || !serviceRequestHasKeyword(request) || !isUserAllowBlockCacheEmptyResponse(response) {
+		return response, err
+	}
+
+	listRequest := cloneServiceRequest(request)
+	delete(listRequest.Params, "keyword")
+	listResponse, err := doRequest(ctx, listRequest)
+	if err != nil {
+		return nil, err
+	}
+	itemCount, ok := userAllowBlockListItemCount(listResponse)
+	if !ok || itemCount == 0 {
+		// A successful empty list is already the correct empty result. Any list
+		// error is returned unchanged for HandleResponse to classify normally.
+		return listResponse, nil
+	}
+
+	sleep(userAllowBlockSearchRetryDelay)
+	retryResponse, err := doRequest(ctx, request)
+	if err != nil || !isUserAllowBlockCacheEmptyResponse(retryResponse) {
+		return retryResponse, err
+	}
+	return emptyUserAllowBlockSearchResponse(listResponse)
+}
+
+func isUserAllowBlockSenderListMethod(methodID string) bool {
+	switch methodID {
+	case "user_mailbox.allow_sender.list", "user_mailbox.blocked_sender.list":
+		return true
+	default:
+		return false
+	}
+}
+
+func serviceRequestHasKeyword(request client.RawApiRequest) bool {
+	keyword, ok := request.Params["keyword"].(string)
+	return ok && strings.TrimSpace(keyword) != ""
+}
+
+func cloneServiceRequest(request client.RawApiRequest) client.RawApiRequest {
+	cloned := request
+	cloned.Params = make(map[string]interface{}, len(request.Params))
+	for key, value := range request.Params {
+		cloned.Params[key] = value
+	}
+	return cloned
+}
+
+func isUserAllowBlockCacheEmptyResponse(response *larkcore.ApiResp) bool {
+	result, ok := serviceJSONResult(response)
+	if !ok || !serviceNumberEquals(result["code"], 456) {
+		return false
+	}
+	var messages []string
+	for _, key := range []string{"msg", "message"} {
+		if value, ok := result[key].(string); ok {
+			messages = append(messages, value)
+		}
+	}
+	if errorBlock, ok := result["error"].(map[string]interface{}); ok {
+		for _, key := range []string{"msg", "message"} {
+			if value, ok := errorBlock[key].(string); ok {
+				messages = append(messages, value)
+			}
+		}
+	}
+	return strings.Contains(strings.Join(messages, " "), "ErrCacheEmpty")
+}
+
+func serviceJSONResult(response *larkcore.ApiResp) (map[string]interface{}, bool) {
+	if response == nil {
+		return nil, false
+	}
+	parsed, err := client.ParseJSONResponse(response)
+	if err != nil {
+		return nil, false
+	}
+	result, ok := parsed.(map[string]interface{})
+	return result, ok
+}
+
+func userAllowBlockListItemCount(response *larkcore.ApiResp) (int, bool) {
+	result, ok := serviceJSONResult(response)
+	if !ok || !serviceNumberEquals(result["code"], 0) {
+		return 0, false
+	}
+	data, ok := result["data"].(map[string]interface{})
+	if !ok {
+		return 0, true
+	}
+	items, exists := data["items"]
+	if !exists || items == nil {
+		return 0, true
+	}
+	itemList, ok := items.([]interface{})
+	if !ok {
+		return 0, false
+	}
+	return len(itemList), true
+}
+
+func emptyUserAllowBlockSearchResponse(listResponse *larkcore.ApiResp) (*larkcore.ApiResp, error) {
+	result, ok := serviceJSONResult(listResponse)
+	if !ok {
+		return listResponse, nil
+	}
+	data, _ := result["data"].(map[string]interface{})
+	if data == nil {
+		data = map[string]interface{}{}
+		result["data"] = data
+	}
+	data["items"] = []interface{}{}
+	data["has_more"] = false
+	delete(data, "page_token")
+	body, err := json.Marshal(result)
+	if err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse, "encode empty mail allow/block search response: %v", err).WithCause(err)
+	}
+	empty := *listResponse
+	empty.RawBody = body
+	return &empty, nil
+}
+
+func serviceNumberEquals(value interface{}, want int) bool {
+	wantString := fmt.Sprint(want)
+	switch typed := value.(type) {
+	case json.Number:
+		return typed.String() == wantString || typed.String() == wantString+".0"
+	case int:
+		return typed == want
+	case int32:
+		return int(typed) == want
+	case int64:
+		return typed == int64(want)
+	case float64:
+		return typed == float64(want)
+	case string:
+		got := strings.TrimSpace(typed)
+		return got == wantString || got == wantString+".0"
+	default:
+		return false
+	}
 }
 
 // checkServiceScopes pre-checks user scopes before making the API call.
