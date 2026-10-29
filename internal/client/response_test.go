@@ -73,6 +73,35 @@ func TestParseJSONResponse(t *testing.T) {
 	}
 }
 
+func TestParseJSONResponse_PreservesIntegerPrecision(t *testing.T) {
+	tests := []struct {
+		name            string
+		lastUpdatedTime string
+	}{
+		{name: "normal timestamp", lastUpdatedTime: "1700000000"},
+		{name: "above float64 exact integer range", lastUpdatedTime: "9007199254740993"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"code":0,"msg":"ok","data":{"status":2,"message_id":"msg_123","last_updated_time":` + tt.lastUpdatedTime + `}}`)
+			resp := newApiResp(body, map[string]string{"Content-Type": "application/json"})
+
+			result, err := ParseJSONResponse(resp)
+			if err != nil {
+				t.Fatalf("ParseJSONResponse failed: %v", err)
+			}
+			data := result.(map[string]interface{})["data"].(map[string]interface{})
+			if got, ok := data["last_updated_time"].(json.Number); !ok || got.String() != tt.lastUpdatedTime {
+				t.Fatalf("last_updated_time = %v (%T), want exact json.Number(%s)", data["last_updated_time"], data["last_updated_time"], tt.lastUpdatedTime)
+			}
+			if data["message_id"] != "msg_123" || data["status"] != json.Number("2") {
+				t.Fatalf("representative fields changed: data=%v", data)
+			}
+		})
+	}
+}
+
 func TestParseJSONResponse_Invalid(t *testing.T) {
 	resp := newApiResp([]byte(`not json`), map[string]string{"Content-Type": "application/json"})
 	_, err := ParseJSONResponse(resp)

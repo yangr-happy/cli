@@ -993,6 +993,63 @@ func TestServiceMethod_JqFilter_AppliesExpression(t *testing.T) {
 	}
 }
 
+func TestServiceMethod_SendStatusPreservesLastUpdatedTime(t *testing.T) {
+	tests := []struct {
+		name            string
+		lastUpdatedTime string
+	}{
+		{name: "normal timestamp", lastUpdatedTime: "1700000000"},
+		{name: "above float64 exact integer range", lastUpdatedTime: "9007199254740993"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, stdout, _, reg := cmdutil.TestFactory(t, &core.CliConfig{
+				AppID: "test-app-send-status", AppSecret: "test-secret-send-status", Brand: core.BrandFeishu,
+			})
+			reg.Register(&httpmock.Stub{
+				URL:     "/open-apis/mail/v1/user_mailboxes/me/messages/msg_123/send_status",
+				RawBody: []byte(`{"code":0,"msg":"ok","data":{"status":2,"message_id":"msg_123","last_updated_time":` + tt.lastUpdatedTime + `}}`),
+			})
+
+			spec := meta.ServiceFromMap(map[string]interface{}{
+				"name": "mail", "servicePath": "/open-apis/mail/v1",
+			})
+			method := meta.FromMap(map[string]interface{}{
+				"path":       "user_mailboxes/{user_mailbox_id}/messages/{message_id}/send_status",
+				"httpMethod": "GET",
+				"parameters": map[string]interface{}{
+					"user_mailbox_id": map[string]interface{}{"type": "string", "location": "path", "required": true},
+					"message_id":      map[string]interface{}{"type": "string", "location": "path", "required": true},
+				},
+			})
+			cmd := NewCmdServiceMethod(f, spec, method, "send_status", "messages", nil)
+			cmd.SetArgs([]string{"--as", "bot", "--params", `{"user_mailbox_id":"me","message_id":"msg_123"}`})
+
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("send_status command failed: %v", err)
+			}
+			var envelope struct {
+				OK   bool `json:"ok"`
+				Data struct {
+					Status          int         `json:"status"`
+					MessageID       string      `json:"message_id"`
+					LastUpdatedTime json.Number `json:"last_updated_time"`
+				} `json:"data"`
+			}
+			dec := json.NewDecoder(strings.NewReader(stdout.String()))
+			dec.UseNumber()
+			if err := dec.Decode(&envelope); err != nil {
+				t.Fatalf("decode command output: %v", err)
+			}
+			if !envelope.OK || envelope.Data.Status != 2 || envelope.Data.MessageID != "msg_123" || envelope.Data.LastUpdatedTime.String() != tt.lastUpdatedTime {
+				t.Fatalf("unexpected send_status output: %+v", envelope)
+			}
+			reg.Verify(t)
+		})
+	}
+}
+
 func TestServiceMethod_JqAndFormatConflict(t *testing.T) {
 	f, _, _, _ := cmdutil.TestFactory(t, testConfig)
 	spec := meta.ServiceFromMap(map[string]interface{}{
